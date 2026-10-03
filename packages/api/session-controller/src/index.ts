@@ -1,6 +1,7 @@
 /** Session Remote owner: cold reads, explicit Agent commands, and live control state. */
 
 import { hostname } from 'node:os'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { resolve } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-fs'
@@ -8,6 +9,7 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-client-file-upload'
+import type {} from '@deepseek-ai/dsh-host-webserver'
 import { canOpenNativePath, nativeFileManager, nativeFileApplications, openNativeFileApplication, openNativeAssociatedPath, revealNativePath } from '@deepseek-ai/dsh-native-command'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionInspection } from '@deepseek-ai/dsh-session-persistence'
@@ -203,6 +205,27 @@ export class SessionController extends TypertRemoteService {
       if (event.type !== 'user/message' || event.data.source.kind !== 'user') return
       ctx.emit('api-session/activity', session.id, event.time)
     })
+
+    // --- 本地定制：脚本桥接路由（课题 #67-484，方案 B） ---------------------
+    // 只做一件事：让外部脚本能建会话 / 发消息，并且因为直接调用下面 create()/
+    // prompt() 这两个已有的公开方法（跟 Remote 协议走的是同一套逻辑），已打开
+    // 的桌面端界面能像平时一样实时看到——不需要另外通知前端刷新。
+    // 纯粹新增、默认不生效：只有显式设了 DSH_SCRIPT_BRIDGE_KEY 环境变量才会注册
+    // 这条路由，不设就跟官方原版行为完全一样，不影响任何已有功能。
+    // 注意：故意不走 ctx.connection.fetch.register——那条注册在 /api 前缀下，
+    // 会先过浏览器登录 cookie 那道闸（没 cookie 一律 401，我们的处理函数根本
+    // 轮不到执行），这正是我们想绕开、不借用登录态的那层。改为直接注入
+    // webServer，在 /api 之外另挂一个路径，只认自己这把暗号。
+    const scriptBridgeKey = process.env.DSH_SCRIPT_BRIDGE_KEY
+    if (scriptBridgeKey !== undefined && scriptBridgeKey.length > 0) {
+      ctx.inject(['webServer'], (webCtx) => {
+        webCtx.effect(() => webCtx.webServer.register({
+          kind: 'exact',
+          path: '/x-script-bridge/session',
+          handler: (req, res) => handleScriptBridgeRequest(this, scriptBridgeKey, req, res),
+        }), 'session-controller: script-bridge route (local customization, #67-484)')
+      })
+    }
   }
 
   private promote(observation: SessionObservation): void {
@@ -533,3 +556,72 @@ export class SessionController extends TypertRemoteService {
 
 export { buildModelCatalog }
 export default SessionController
+
+/**
+ * 本地定制（课题 #67-484，方案 B）：脚本桥接路由的实际处理函数。
+ *
+ * 只认两个动作：
+ *   - {"action":"create", "payload": SessionCreateRequest}
+ *   - {"action":"prompt", "payload": SessionPromptRequest}
+ * 直接转调 SessionController 已有的 create()/prompt() 公开方法——跟界面点
+ * 按钮触发的是同一条代码路径，不碰 Remote/typert 协议那一层，也不复用浏览器
+ * 登录态，鉴权只看请求头 `x-script-bridge-key` 是否等于启动时设的那个值。
+ * @param controller - 当前 SessionController 实例，借用它已有的 create/prompt。
+ * @param expectedKey - 启动时从 DSH_SCRIPT_BRIDGE_KEY 环境变量读到的暗号。
+ * @param request - 原始 Fetch 请求。
+ * @returns JSON 响应：成功 200，暗号不对 401，格式不对或内部出错 400/500。
+ */
+function writeScriptBridgeJson(res: ServerResponse, status: number, value: unknown): void {
+  const text = JSON.stringify(value)
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(text)
+}
+
+async function readScriptBridgeBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(chunk as Buffer)
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+async function handleScriptBridgeRequest(
+  controller: SessionController,
+  expectedKey: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (req.method !== 'POST') {
+    writeScriptBridgeJson(res, 405, { error: 'POST only' })
+    return
+  }
+  if (req.headers['x-script-bridge-key'] !== expectedKey) {
+    writeScriptBridgeJson(res, 401, { error: 'unauthorized' })
+    return
+  }
+  let body: unknown
+  try {
+    body = JSON.parse(await readScriptBridgeBody(req))
+  } catch {
+    writeScriptBridgeJson(res, 400, { error: 'invalid JSON body' })
+    return
+  }
+  if (typeof body !== 'object' || body === null || !('action' in body) || !('payload' in body)) {
+    writeScriptBridgeJson(res, 400, { error: 'expected {"action","payload"}' })
+    return
+  }
+  const { action, payload } = body as { action: unknown; payload: unknown }
+  try {
+    if (action === 'create') {
+      const value = await controller.create(payload as SessionCreateRequest)
+      writeScriptBridgeJson(res, 200, { ok: true, result: value })
+      return
+    }
+    if (action === 'prompt') {
+      const value = await controller.prompt(payload as SessionPromptRequest, new AbortController().signal)
+      writeScriptBridgeJson(res, 200, { ok: true, result: value })
+      return
+    }
+    writeScriptBridgeJson(res, 400, { error: `unknown action "${String(action)}"` })
+  } catch (error) {
+    writeScriptBridgeJson(res, 500, { error: errorChain(error) })
+  }
+}
