@@ -223,9 +223,7 @@ export class SessionController extends TypertRemoteService {
       // 上面几行官方原有的监听器行为。sessionId 对应哪个对话，cwd 对应哪个文件夹，
       // 都从这几个事件本身带的字段里取，不用额外猜。
       ctx.on('session/created', (session) => {
-        pushScriptBridgeEvent('session-created', session.id, session.header.cwd === undefined
-          ? {}
-          : { cwd: session.header.cwd })
+        pushScriptBridgeEvent('session-created', session.id, { cwd: session.header.cwd })
       })
       ctx.on('session/disposed', (session) => {
         pushScriptBridgeEvent('session-disposed', session.id)
@@ -235,6 +233,23 @@ export class SessionController extends TypertRemoteService {
       })
       ctx.on('agent/error', ({ agent, error }) => {
         pushScriptBridgeEvent('agent-error', agent.id, { detail: errorChain(error) })
+      })
+      // usage_source：每一步模型调用的 token 用量挂在 assistant/message 事件上，
+      // 跟 request/header、user/message 走的是同一条既有的 session/event 通道，
+      // 这里单独加一个监听器只读不改，不动上面原有的 session/event 处理逻辑。
+      ctx.on('session/event', (session, event) => {
+        if (event.type !== 'assistant/message' || event.data.usage === undefined) return
+        const usage = event.data.usage
+        pushScriptBridgeEvent('assistant-usage', session.id, {
+          usage: {
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            ...(usage.totalTokens === undefined ? {} : { totalTokens: usage.totalTokens }),
+            ...(usage.cacheReadTokens === undefined ? {} : { cacheReadTokens: usage.cacheReadTokens }),
+            ...(usage.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: usage.cacheWriteTokens }),
+            ...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
+          },
+        })
       })
       ctx.inject(['webServer'], (webCtx) => {
         webCtx.effect(() => webCtx.webServer.register({
@@ -583,14 +598,26 @@ export default SessionController
 interface ScriptBridgeEvent {
   readonly seq: number
   readonly time: number
-  /** session-created=开工；session-disposed/agent-idle=收工；agent-error=收工且异常。 */
-  readonly type: 'session-created' | 'session-disposed' | 'agent-running' | 'agent-idle' | 'agent-error'
+  /**
+   * session-created=开工；session-disposed/agent-idle=收工；agent-error=收工且异常；
+   * assistant-usage=这一步模型调用的用量（usage_source）。
+   */
+  readonly type: 'session-created' | 'session-disposed' | 'agent-running' | 'agent-idle' | 'agent-error' | 'assistant-usage'
   /** 对应哪个对话。 */
   readonly sessionId: string
   /** 对应哪个文件夹，只有 session-created 带。 */
   readonly cwd?: string
   /** agent-error 的错误详情，即退出原因。 */
   readonly detail?: string
+  /** assistant-usage 专用：这一步的 token 用量，字段名沿用引擎内部 TokenUsage。 */
+  readonly usage?: {
+    readonly inputTokens: number
+    readonly outputTokens: number
+    readonly totalTokens?: number
+    readonly cacheReadTokens?: number
+    readonly cacheWriteTokens?: number
+    readonly reasoningTokens?: number
+  }
 }
 const SCRIPT_BRIDGE_EVENT_CAP = 1000
 const scriptBridgeEvents: ScriptBridgeEvent[] = []
@@ -599,10 +626,13 @@ let scriptBridgeEventSeq = 0
 function pushScriptBridgeEvent(
   type: ScriptBridgeEvent['type'],
   sessionId: string,
-  extra: { cwd?: string; detail?: string } = {},
+  extra: { cwd?: string | undefined; detail?: string | undefined; usage?: ScriptBridgeEvent['usage'] } = {},
 ): void {
   scriptBridgeEventSeq += 1
-  scriptBridgeEvents.push({ seq: scriptBridgeEventSeq, time: Date.now(), type, sessionId, ...extra })
+  const entry: ScriptBridgeEvent = { seq: scriptBridgeEventSeq, time: Date.now(), type, sessionId }
+  const record = entry as unknown as Record<string, unknown>
+  for (const [key, value] of Object.entries(extra)) if (value !== undefined) record[key] = value
+  scriptBridgeEvents.push(entry)
   if (scriptBridgeEvents.length > SCRIPT_BRIDGE_EVENT_CAP) scriptBridgeEvents.shift()
 }
 
