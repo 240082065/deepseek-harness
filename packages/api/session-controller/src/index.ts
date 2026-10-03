@@ -218,6 +218,24 @@ export class SessionController extends TypertRemoteService {
     // webServer，在 /api 之外另挂一个路径，只认自己这把暗号。
     const scriptBridgeKey = process.env.DSH_SCRIPT_BRIDGE_KEY
     if (scriptBridgeKey !== undefined && scriptBridgeKey.length > 0) {
+      // devhub 的 HarnessContract 要求执行器能报告「开工/收工」事件(exit_reason)、
+      // 能被打断(cancel)；这里另开几路监听，只追加进我们自己的环形缓冲区，不改
+      // 上面几行官方原有的监听器行为。sessionId 对应哪个对话，cwd 对应哪个文件夹，
+      // 都从这几个事件本身带的字段里取，不用额外猜。
+      ctx.on('session/created', (session) => {
+        pushScriptBridgeEvent('session-created', session.id, session.header.cwd === undefined
+          ? {}
+          : { cwd: session.header.cwd })
+      })
+      ctx.on('session/disposed', (session) => {
+        pushScriptBridgeEvent('session-disposed', session.id)
+      })
+      ctx.on('agent/status', ({ agent, status }) => {
+        pushScriptBridgeEvent(status === 'running' ? 'agent-running' : 'agent-idle', agent.id)
+      })
+      ctx.on('agent/error', ({ agent, error }) => {
+        pushScriptBridgeEvent('agent-error', agent.id, { detail: errorChain(error) })
+      })
       ctx.inject(['webServer'], (webCtx) => {
         webCtx.effect(() => webCtx.webServer.register({
           kind: 'exact',
@@ -558,15 +576,49 @@ export { buildModelCatalog }
 export default SessionController
 
 /**
+ * 本地定制（课题 #67-484，方案 B）：脚本建会话/发消息的「开工」「收工」事件环形
+ * 缓冲区——满足 devhub HarnessContract 的 exit_reason / event_stream 要求。
+ * 只在 DSH_SCRIPT_BRIDGE_KEY 生效时才有监听器往里写，平时是空数组，零开销。
+ */
+interface ScriptBridgeEvent {
+  readonly seq: number
+  readonly time: number
+  /** session-created=开工；session-disposed/agent-idle=收工；agent-error=收工且异常。 */
+  readonly type: 'session-created' | 'session-disposed' | 'agent-running' | 'agent-idle' | 'agent-error'
+  /** 对应哪个对话。 */
+  readonly sessionId: string
+  /** 对应哪个文件夹，只有 session-created 带。 */
+  readonly cwd?: string
+  /** agent-error 的错误详情，即退出原因。 */
+  readonly detail?: string
+}
+const SCRIPT_BRIDGE_EVENT_CAP = 1000
+const scriptBridgeEvents: ScriptBridgeEvent[] = []
+let scriptBridgeEventSeq = 0
+
+function pushScriptBridgeEvent(
+  type: ScriptBridgeEvent['type'],
+  sessionId: string,
+  extra: { cwd?: string; detail?: string } = {},
+): void {
+  scriptBridgeEventSeq += 1
+  scriptBridgeEvents.push({ seq: scriptBridgeEventSeq, time: Date.now(), type, sessionId, ...extra })
+  if (scriptBridgeEvents.length > SCRIPT_BRIDGE_EVENT_CAP) scriptBridgeEvents.shift()
+}
+
+/**
  * 本地定制（课题 #67-484，方案 B）：脚本桥接路由的实际处理函数。
  *
- * 只认两个动作：
- *   - {"action":"create", "payload": SessionCreateRequest}
- *   - {"action":"prompt", "payload": SessionPromptRequest}
- * 直接转调 SessionController 已有的 create()/prompt() 公开方法——跟界面点
- * 按钮触发的是同一条代码路径，不碰 Remote/typert 协议那一层，也不复用浏览器
+ * 认四个动作：
+ *   - {"action":"create", "payload": SessionCreateRequest} 建会话（开工入口之一）
+ *   - {"action":"prompt", "payload": SessionPromptRequest} 发消息
+ *   - {"action":"cancel", "payload": SessionCancelRequest} 打断当前轮
+ *   - {"action":"events", "payload": {"sinceSeq"?: number}} 读开工/收工事件，
+ *     sinceSeq 省略或给 0 表示从头读，否则只读比它新的
+ * create/prompt/cancel 直接转调 SessionController 已有的同名公开方法——跟界面
+ * 点按钮触发的是同一条代码路径，不碰 Remote/typert 协议那一层，也不复用浏览器
  * 登录态，鉴权只看请求头 `x-script-bridge-key` 是否等于启动时设的那个值。
- * @param controller - 当前 SessionController 实例，借用它已有的 create/prompt。
+ * @param controller - 当前 SessionController 实例，借用它已有的 create/prompt/cancel。
  * @param expectedKey - 启动时从 DSH_SCRIPT_BRIDGE_KEY 环境变量读到的暗号。
  * @param request - 原始 Fetch 请求。
  * @returns JSON 响应：成功 200，暗号不对 401，格式不对或内部出错 400/500。
@@ -618,6 +670,19 @@ async function handleScriptBridgeRequest(
     if (action === 'prompt') {
       const value = await controller.prompt(payload as SessionPromptRequest, new AbortController().signal)
       writeScriptBridgeJson(res, 200, { ok: true, result: value })
+      return
+    }
+    if (action === 'cancel') {
+      const value = controller.cancel(payload as SessionCancelRequest)
+      writeScriptBridgeJson(res, 200, { ok: true, result: value })
+      return
+    }
+    if (action === 'events') {
+      const sinceSeq = typeof (payload as { sinceSeq?: unknown } | undefined)?.sinceSeq === 'number'
+        ? (payload as { sinceSeq: number }).sinceSeq
+        : 0
+      const events = scriptBridgeEvents.filter(e => e.seq > sinceSeq)
+      writeScriptBridgeJson(res, 200, { ok: true, result: { events, lastSeq: scriptBridgeEventSeq } })
       return
     }
     writeScriptBridgeJson(res, 400, { error: `unknown action "${String(action)}"` })
