@@ -255,7 +255,13 @@ export class SessionController extends TypertRemoteService {
         webCtx.effect(() => webCtx.webServer.register({
           kind: 'exact',
           path: '/x-script-bridge/session',
-          handler: (req, res) => handleScriptBridgeRequest(this, scriptBridgeKey, req, res),
+          handler: (req, res) => handleScriptBridgeRequest(
+            this,
+            scriptBridgeKey,
+            () => (ctx as unknown as { get(name: string): unknown }).get('commands') as ScriptBridgeCommands | undefined,
+            req,
+            res,
+          ),
         }), 'session-controller: script-bridge route (local customization, #67-484)')
       })
     }
@@ -665,9 +671,16 @@ async function readScriptBridgeBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
+/** 斜杠命令注册表（interaction/commands）里桥接用到的最小形状；只用结构类型，不新增包依赖。 */
+interface ScriptBridgeCommands {
+  list(agent: Agent): readonly unknown[]
+  execute(agent: Agent, line: string, attachments: readonly never[], signal: AbortSignal): Promise<unknown>
+}
+
 async function handleScriptBridgeRequest(
   controller: SessionController,
   expectedKey: string,
+  getCommands: () => ScriptBridgeCommands | undefined,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -705,6 +718,22 @@ async function handleScriptBridgeRequest(
     if (action === 'cancel') {
       const value = controller.cancel(payload as SessionCancelRequest)
       writeScriptBridgeJson(res, 200, { ok: true, result: value })
+      return
+    }
+    if (action === 'commands' || action === 'command') {
+      const { sessionId, line } = payload as { sessionId?: unknown; line?: unknown }
+      const commands = getCommands()
+      if (commands === undefined) { writeScriptBridgeJson(res, 500, { error: 'commands service unavailable' }); return }
+      if (typeof sessionId !== 'string') { writeScriptBridgeJson(res, 400, { error: 'sessionId required' }); return }
+      const resolved = await controller.resolveAgent(sessionId as SessionId)
+      if ('error' in resolved) { writeScriptBridgeJson(res, 404, { error: resolved.error }); return }
+      if (action === 'commands') {
+        writeScriptBridgeJson(res, 200, { ok: true, result: commands.list(resolved.agent) })
+        return
+      }
+      if (typeof line !== 'string') { writeScriptBridgeJson(res, 400, { error: 'line required' }); return }
+      const execution = await commands.execute(resolved.agent, line, [], new AbortController().signal)
+      writeScriptBridgeJson(res, 200, { ok: true, result: { matched: execution !== undefined, execution } })
       return
     }
     if (action === 'events') {
